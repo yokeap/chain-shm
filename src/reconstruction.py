@@ -1,24 +1,18 @@
 """
-reconstruction.py  v8
+reconstruction.py  v9
 =====================
-Link #1 (left link) only — top arc + bottom arc
+Link #1 (left link) only — top arc + bottom arc + SIDE ARC (occluded zone)
 
-Control points (top arc):
+Control points per arc (top / bottom):
   Outer RED  5 pts: (1)L, (5)L, (3), (5)R, (1)R
   Inner BLUE 5 pts: (2)L, (6)L, (4), (6)R, (2)R
 
-Control points (bottom arc) — mirror of top:
-  Outer RED  5 pts: (1)L, (5)L, (3), (5)R, (1)R  (outer = bottommost edge)
-  Inner BLUE 5 pts: (2)L, (6)L, (4), (6)R, (2)R  (inner = topmost edge)
+NEW — Side arc (occluded zone, behind horizontal wire):
+  (7) = midpoint of outer side arc  (5)_top → (1)_top → (1)_bot → (5)_bot
+  (8) = (7) offset inward by d     (d = mean wire thickness)
+  Inner side arc = (6)_top → (2)_top → (8) → (2)_bot → (6)_bot
 
-  (1) tip corner  (blob height ≈ 0 at edge)
-  (2) wire-contact boundary  (inner edge flat-zone boundary)
-  (3) outer apex  (x_mid of (1)L.x → (1)R.x)
-  (4) inner mid   (same x as (3), opposite edge)
-  (5) outer at x of (2)
-  (6) inner at x = midpoint((2).x, (3).x)
-
-  d = |inner(x_apex) − outer(x_apex)|  (top arc)
+  See side_arc.py for the interpolation logic.
 """
 
 from __future__ import annotations
@@ -30,6 +24,8 @@ import cv2
 import numpy as np
 from scipy.ndimage import label as scipy_label
 from scipy.ndimage import uniform_filter1d
+
+from side_arc import compute_side_arcs
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +78,8 @@ def _pair_blobs(mask: np.ndarray) -> List[Dict]:
                 "top_y1": t["y1"], "bot_y2": b["y2"],
                 "cx": t["cx"],
             })
-    # sort by cx → leftmost first
     pairs.sort(key=lambda p: p["cx"])
-    return pairs[:1]   # ← ONLY Link #1
+    return pairs[:1]
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -121,7 +116,7 @@ def _nearest_idx(xs, x_target):
 
 
 # ══════════════════════════════════════════════════════════════════
-# C.  Control points — top blob (outer=top edge, inner=bot edge)
+# C.  Control points — top blob
 # ══════════════════════════════════════════════════════════════════
 
 def _ctrl_top(comp, x1, x2) -> Dict:
@@ -132,7 +127,6 @@ def _ctrl_top(comp, x1, x2) -> Dict:
     li = _find_tip(xs, tops, bots, "left")
     ri = _find_tip(xs, tops, bots, "right")
 
-    # wire contact: inner (bots) drops from max
     sm  = uniform_filter1d(bots, size=min(80, len(bots)//4*2+1))
     contact = np.where(sm <= sm.max() - 8)[0]
     wli = int(contact[0])  if len(contact) else len(xs)//4
@@ -157,7 +151,7 @@ def _ctrl_top(comp, x1, x2) -> Dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# D.  Control points — bottom blob  (mirror of top, outer↔inner swapped)
+# D.  Control points — bottom blob
 # ══════════════════════════════════════════════════════════════════
 
 def _ctrl_bot(comp, x1, x2) -> Dict:
@@ -165,12 +159,9 @@ def _ctrl_bot(comp, x1, x2) -> Dict:
     if len(xs) < 10:
         return {}
 
-    # same tip logic as top
     li = _find_tip(xs, tops, bots, "left")
     ri = _find_tip(xs, tops, bots, "right")
 
-    # wire contact: inner = tops = U-shape
-    # (2) = local minimum ของ tops ในแต่ละ half = มุมที่ inner edge โค้งเข้า
     sm   = uniform_filter1d(tops.astype(float), size=30)
     n    = len(xs)
     half = n // 2
@@ -182,7 +173,6 @@ def _ctrl_bot(comp, x1, x2) -> Dict:
     i6l = _nearest_idx(xs, (int(xs[wli]) + x_apex) // 2)
     i6r = _nearest_idx(xs, (int(xs[wri]) + x_apex) // 2)
 
-    # outer = bots (bottom edge),  inner = tops (top edge)  — exact mirror of _ctrl_top
     def pt(i, e): return (int(xs[i]), int(tops[i] if e == "top" else bots[i]))
 
     return {
@@ -197,7 +187,7 @@ def _ctrl_bot(comp, x1, x2) -> Dict:
 
 
 # ══════════════════════════════════════════════════════════════════
-# E.  Polynomial fit (exact, degree = n_pts - 1)
+# E.  Polynomial fit
 # ══════════════════════════════════════════════════════════════════
 
 def _fit_exact_poly(pts: list) -> Optional[np.ndarray]:
@@ -237,6 +227,7 @@ YELLOW = (0,  220, 255)
 PURPLE = (200,  60, 180)
 GREEN  = (50,  200,  50)
 WHITE  = (255, 255, 255)
+ORANGE = (0,  165, 255)
 
 
 def _draw_curve(vis, coef, x1, x2, color, thickness=3):
@@ -247,6 +238,20 @@ def _draw_curve(vis, coef, x1, x2, color, thickness=3):
     pts = np.column_stack([xs, ys]).astype(np.int32).reshape(-1, 1, 2)
     if len(pts) >= 2:
         cv2.polylines(vis, [pts], False, color, thickness, cv2.LINE_AA)
+
+
+def _draw_polyline_dashed(vis, pts, color, thickness=3, seg=14, gap=10):
+    """Draw a dashed polyline from an (N, 2) float array."""
+    pts_i = pts.astype(np.int32).reshape(-1, 1, 2)
+    n = len(pts_i)
+    i = 0
+    drawing = True
+    while i < n:
+        end = min(i + (seg if drawing else gap), n)
+        if drawing and end - i >= 2:
+            cv2.polylines(vis, [pts_i[i:end]], False, color, thickness, cv2.LINE_AA)
+        i = end
+        drawing = not drawing
 
 
 def _dot(vis, pt, color, r=10, label=None):
@@ -266,28 +271,23 @@ def _draw_arc(vis, cp, coef_outer, coef_inner, x1, x2):
     _draw_curve(vis, coef_outer, x1, x2, RED,  3)
     _draw_curve(vis, coef_inner, x1, x2, BLUE, 3)
 
-    # purple baseline at inner-mid y
     if cp.get("pt4"):
         py = cp["pt4"][1]
         cv2.line(vis, (x1, py), (x2, py), PURPLE, 2, cv2.LINE_AA)
 
-    # outer dots (RED)
     for k, lbl in (("pt1_left","1"),("pt5_left","5"),("pt3","3"),
                    ("pt5_right","5"),("pt1_right","1")):
         _dot(vis, cp.get(k), RED, 10, lbl)
 
-    # inner dots (BLUE)
     for k, lbl in (("pt2_left","2"),("pt6_left","6"),("pt4","4"),
                    ("pt6_right","6"),("pt2_right","2")):
         _dot(vis, cp.get(k), BLUE, 10, lbl)
 
-    # green verticals: (5)→(2) and (3)→(4)
     for rk, bk in (("pt5_left","pt2_left"),("pt5_right","pt2_right"),("pt3","pt4")):
         rp, bp = cp.get(rk), cp.get(bk)
         if rp and bp:
             cv2.line(vis, rp, bp, GREEN, 2, cv2.LINE_AA)
 
-    # d line (yellow) at apex
     if coef_outer is not None and coef_inner is not None:
         y_o = int(_poly_eval(coef_outer, xap))
         y_i = int(_poly_eval(coef_inner, xap))
@@ -296,6 +296,25 @@ def _draw_arc(vis, cp, coef_outer, coef_inner, x1, x2):
         cv2.putText(vis, f"d={d_px:.0f}px",
                     (xap + 10, (y_o + y_i) // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, YELLOW, 2, cv2.LINE_AA)
+
+
+def _draw_side_arc(vis, sa: Dict):
+    """Draw the occluded side-arc reconstruction with d label."""
+    _draw_polyline_dashed(vis, sa["outer_pts"], ORANGE, 3, seg=14, gap=10)
+    _draw_polyline_dashed(vis, sa["inner_pts"], YELLOW, 3, seg=10, gap=8)
+
+    _dot(vis, sa["pt7"], ORANGE, 14, "7")
+    _dot(vis, sa["pt8"], ORANGE, 14, "8")
+
+    p7, p8 = sa["pt7"], sa["pt8"]
+    cv2.line(vis, (int(p7[0]), int(p7[1])), (int(p8[0]), int(p8[1])),
+             YELLOW, 3, cv2.LINE_AA)
+
+    d_px = sa["d_side_px"]
+    mx = (p7[0] + p8[0]) / 2
+    my = (p7[1] + p8[1]) / 2
+    cv2.putText(vis, f"d={d_px:.0f}px", (int(mx) + 8, int(my) + 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, YELLOW, 2, cv2.LINE_AA)
 
 
 def _draw_results(image, results):
@@ -309,11 +328,15 @@ def _draw_results(image, results):
         _draw_arc(vis, res["cp_bot"], res["coef_outer_bot"],
                   res["coef_inner_bot"], x1b, x2b)
 
-        # overall info panel
+        for sa in res.get("side_arcs", []):
+            _draw_side_arc(vis, sa)
+
         py = max(30, res["top_y1"] - 14)
-        cv2.rectangle(vis, (x1t-4, py-26), (x1t+310, py+8), (20,20,20), -1)
+        cv2.rectangle(vis, (x1t-4, py-26), (x1t+600, py+8), (20,20,20), -1)
         cv2.putText(vis,
-            f"Link #1  top={res['d_top_px']:.0f}  bot={res['d_bot_px']:.0f}  mean={res['d_mean_px']:.0f}  min={res['d_min_px']:.0f}px  diff={res['diff_pct']:.1f}%",
+            f"Link #1  top={res['d_top_px']:.0f}  bot={res['d_bot_px']:.0f}"
+            f"  mean={res['d_mean_px']:.0f}  min={res['d_min_px']:.0f}px"
+            f"  diff={res['diff_pct']:.1f}%",
             (x1t+4, py), cv2.FONT_HERSHEY_SIMPLEX, 0.75, WHITE, 2, cv2.LINE_AA)
     return vis
 
@@ -353,6 +376,21 @@ def reconstruct_links(
         d_min  = min(d_top, d_bot)
         diff_pct = abs(d_top - d_bot) / d_mean * 100 if d_mean > 0 else 0
 
+        # ── Side-arc reconstruction (NEW in v9) ──
+        side_arcs = []
+        for side in ("left", "right"):
+            try:
+                sa = compute_side_arcs(cp_t, cp_b, d_mean, side)
+                side_arcs.append(sa)
+                logger.info(
+                    f"  Link {lid+1} side={side}: "
+                    f"pt7=({sa['pt7'][0]:.0f},{sa['pt7'][1]:.0f})  "
+                    f"pt8=({sa['pt8'][0]:.0f},{sa['pt8'][1]:.0f})  "
+                    f"d_side={sa['d_side_px']:.1f}px"
+                )
+            except Exception as e:
+                logger.warning(f"  Side arc ({side}) failed: {e}")
+
         logger.info(
             f"  Link {lid+1}: d_top={d_top:.1f}px  d_bot={d_bot:.1f}px  "
             f"d_mean={d_mean:.1f}px  d_min={d_min:.1f}px  "
@@ -369,11 +407,11 @@ def reconstruct_links(
             "d_mean_px": d_mean,  "d_mean_mm": d_mean / px_per_mm,
             "d_min_px" : d_min,   "d_min_mm" : d_min  / px_per_mm,
             "diff_pct" : diff_pct,
-            # legacy keys
             "d_px": d_mean, "d_mm": d_mean / px_per_mm,
             "cp_top": cp_t, "cp_bot": cp_b,
             "coef_outer_top": coef_ot, "coef_inner_top": coef_it,
             "coef_outer_bot": coef_ob, "coef_inner_bot": coef_ib,
+            "side_arcs": side_arcs,
         })
 
     vis = _draw_results(image, results)
@@ -412,9 +450,20 @@ def main() -> None:
     export = []
     for r in results:
         row = {k: v for k, v in r.items()
-               if not k.startswith("coef_") and k not in ("cp_top","cp_bot")}
+               if not k.startswith("coef_") and k not in ("cp_top","cp_bot","side_arcs")}
         for key in ("coef_outer_top","coef_inner_top","coef_outer_bot","coef_inner_bot"):
             row[key] = r[key].tolist() if r[key] is not None else None
+        sa_export = []
+        for sa in r.get("side_arcs", []):
+            sa_export.append({
+                "pt7": list(sa["pt7"]),
+                "pt8": list(sa["pt8"]),
+                "d_side_px": sa["d_side_px"],
+                "outer_ctrl": [list(p) for p in sa["outer_ctrl"]],
+                "inner_ctrl": [list(p) if isinstance(p, tuple) else list(p)
+                               for p in sa["inner_ctrl"]],
+            })
+        row["side_arcs"] = sa_export
         export.append(row)
     with open(save_dir / f"recon_{stem}.json", "w") as f:
         json.dump(export, f, indent=2)
@@ -427,7 +476,11 @@ def main() -> None:
         print(f"  {r['link_id']+1:>4}  {r['d_top_px']:>8.1f}  {r['d_bot_px']:>8.1f}"
               f"  {r['d_mean_px']:>8.1f}  {r['d_min_px']:>8.1f}  {r['diff_pct']:>6.1f}%")
     print(sep)
-    print(f"  Note: diff > 5% → check camera tilt or uneven wear")
+    for r in results:
+        for sa in r.get("side_arcs", []):
+            print(f"  Side arc: pt7=({sa['pt7'][0]:.0f},{sa['pt7'][1]:.0f})  "
+                  f"pt8=({sa['pt8'][0]:.0f},{sa['pt8'][1]:.0f})  "
+                  f"d_side={sa['d_side_px']:.0f}px")
     print(f"{sep}\n")
 
 
