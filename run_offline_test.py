@@ -1,117 +1,194 @@
 """
-scripts/run_offline_test.py
+offline_test.py
+===============
+Pipeline test: รัน vertical_link_seg → reconstruction → แสดงผล
 
-Quick offline test that:
-  1. Copies the sample image into data/samples/
-  2. Runs the adaptive segmenter (no GPU / FastSAM required)
-  3. Saves annotated output + thickness plot
+Usage
+-----
+    python3 offline_test.py --image chain.png
+    python3 offline_test.py --image chain.png --model sam_b.pt --px-per-mm 12.5
+    python3 offline_test.py --image chain.png --skip-sam   # ใช้ simple wire mask แทน SAM
 
-Run from project root:
-    uv run python run_offline_test.py --image path/to/chain.jpg
+Outputs (ใน debug_seg/)
+-----------------------
+    mask_full_<stem>.jpg    - full chain mask  (Step 1)
+    mask_wire_<stem>.jpg    - horizontal wire mask (Step 2 / fallback)
+    mask_vert_<stem>.jpg    - vertical link mask   (Step 3)
+    vert_<stem>.jpg         - vertical link overlay (green)
+    reconstruction.jpg      - d measurement + arc reconstruction (blue/red)
+    report.txt              - text summary
 """
 
-from __future__ import annotations
-
 import argparse
-import shutil
+import logging
+import sys
+import time
 from pathlib import Path
 
 import cv2
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 
-# ── make sure src/ is importable when running directly ──────────────────────
-import sys
+# ── ensure src/ is importable ──────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+from vertical_link_seg     import get_full_mask, get_wire_mask_sam, get_vertical_link_mask, draw_result
+from perspective_correction import correct_tilt
+from reconstruction         import reconstruct_links
 
-from inspector import (
-    ChainSegmenter,
-    ThicknessAnalyser,
-    ResultAnnotator,
+logging.basicConfig(
+    level  = logging.INFO,
+    format = "%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt= "%H:%M:%S",
 )
-from loguru import logger
+logger = logging.getLogger(__name__)
 
 
-def run(image_path: Path, reject_threshold: float = 0.10) -> None:
-    logger.info(f"Loading image: {image_path}")
-    image = cv2.imread(str(image_path))
-    if image is None:
-        raise FileNotFoundError(image_path)
+# ────────────────────────────────────────────────────────────────────────────
+# Fallback wire mask (ไม่ใช้ SAM)
+# ────────────────────────────────────────────────────────────────────────────
 
-    # --- Segmentation ---------------------------------------------------
-    logger.info("Segmenting (adaptive threshold mode)…")
-    seg   = ChainSegmenter()
-    mask  = seg.segment(image)
+def get_wire_mask_simple(
+    gray     : np.ndarray,
+    full_mask: np.ndarray,
+) -> np.ndarray:
+    """
+    Simple heuristic wire mask (ไม่ต้องใช้ SAM):
+    - หา horizontal band ที่ค่า intensity เฉลี่ยต่ำที่สุด (เหล็กมืด)
+      ภายใน full_mask zone เท่านั้น
+    - ใช้ Sobel horizontal + threshold เพื่อจำกัดให้แคบ
+    """
+    h, w = gray.shape
 
-    # --- Thickness analysis ----------------------------------------------
-    logger.info("Analysing thickness…")
-    analyser = ThicknessAnalyser(reject_threshold=reject_threshold)
-    result   = analyser.analyse(mask)
+    # mask-weighted row mean (เฉพาะ pixel ที่อยู่บนเนื้อโซ่)
+    row_means = []
+    for y in range(h):
+        row_px = gray[y, full_mask[y, :] > 0]
+        row_means.append(float(row_px.mean()) if len(row_px) > 0 else 255.0)
+    row_means = np.array(row_means)
 
-    logger.info(
-        f"Reference={result.reference_thickness_px:.1f}px  "
-        f"MinThick={result.min_local_thickness_px:.1f}px  "
-        f"Wear={result.wear_percent:.2f}%  "
-        f"{'REJECT' if result.is_rejected else 'PASS'}"
+    # ช่วง 10% มืดที่สุด → นั่นคือแนว horizontal wire
+    thresh = np.percentile(row_means, 15)
+    wire_rows = np.where(row_means < thresh)[0]
+
+    wire_mask = np.zeros((h, w), dtype=np.uint8)
+    if len(wire_rows) > 0:
+        y_min = max(0,     int(wire_rows[0])  - 5)
+        y_max = min(h - 1, int(wire_rows[-1]) + 5)
+        # เฉพาะ pixel ที่อยู่บน full_mask เท่านั้น
+        wire_mask[y_min:y_max + 1, :] = full_mask[y_min:y_max + 1, :]
+
+    return wire_mask
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Chain wear analysis: seg → reconstruct → wear %"
     )
+    parser.add_argument("--image",      required=True,       help="Input image")
+    parser.add_argument("--model",      default="sam_b.pt",  help="SAM model path")
+    parser.add_argument("--skip-sam",   action="store_true", help="Use simple wire mask (no SAM)")
+    parser.add_argument("--px-per-mm",  type=float, default=1.0, help="Calibration px/mm")
+    parser.add_argument("--save-dir",   default="debug_seg", help="Output directory")
+    args = parser.parse_args()
 
-    # --- Annotate --------------------------------------------------------
-    annotator  = ResultAnnotator()
-    annotated  = annotator.draw(image, mask, result)
+    t0       = time.time()
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Save outputs ----------------------------------------------------
-    out_dir = Path("data/samples")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    img  = cv2.imread(args.image)
+    if img is None:
+        logger.error(f"Cannot open image: {args.image}")
+        sys.exit(1)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    stem = Path(args.image).stem
 
-    annotated_path = out_dir / f"annotated_{image_path.stem}.jpg"
-    cv2.imwrite(str(annotated_path), annotated)
-    logger.info(f"Saved annotated image → {annotated_path}")
+    # ── Step 1: Full chain mask ─────────────────────────────────────────────
+    logger.info("─── Step 1: Wiener + Otsu → full chain mask")
+    full_mask = get_full_mask(gray)
+    cv2.imwrite(str(save_dir / f"mask_full_{stem}.jpg"), full_mask)
 
-    # --- Thickness profile plot ------------------------------------------
-    if len(result.thickness_profile) > 0:
-        fig, ax = plt.subplots(figsize=(10, 3))
-        x = np.arange(len(result.thickness_profile))
-        ax.plot(x, result.thickness_profile, color="#2196F3", lw=1.5, label="Local thickness (px)")
-        ax.axhline(result.reference_thickness_px,
-                   color="#4CAF50", ls="--", lw=1.2, label=f"Reference ({result.reference_thickness_px:.1f} px)")
-        ax.axhline(result.min_local_thickness_px,
-                   color="#F44336", ls=":",  lw=1.2, label=f"Min ({result.min_local_thickness_px:.1f} px)")
-        reject_line = result.reference_thickness_px * (1 - reject_threshold)
-        ax.axhline(reject_line,
-                   color="#FF9800", ls="-.", lw=1.2, label=f"Reject limit ({reject_line:.1f} px)")
-        ax.fill_between(x, 0, result.thickness_profile,
-                        where=(result.thickness_profile < reject_line),
-                        alpha=0.25, color="#F44336", label="Worn zone")
-        ax.set_xlabel("Skeleton position")
-        ax.set_ylabel("Thickness (pixels)")
-        ax.set_title(f"Chain wear profile – {image_path.name}  |  Wear {result.wear_percent:.2f}%")
-        ax.legend(fontsize=8)
-        ax.grid(alpha=0.3)
-        plot_path = out_dir / f"thickness_profile_{image_path.stem}.png"
-        fig.tight_layout()
-        fig.savefig(str(plot_path), dpi=120)
-        plt.close(fig)
-        logger.info(f"Saved thickness plot → {plot_path}")
+    # ── Step 2: Wire mask ───────────────────────────────────────────────────
+    if args.skip_sam:
+        logger.info("─── Step 2: Simple heuristic wire mask (SAM skipped)")
+        wire_mask = get_wire_mask_simple(gray, full_mask)
+    else:
+        logger.info("─── Step 2: SAM → horizontal wire mask")
+        wire_mask = get_wire_mask_sam(img, full_mask, args.model)
+    cv2.imwrite(str(save_dir / f"mask_wire_{stem}.jpg"), wire_mask)
 
-    # --- Mask visualisation ----------------------------------------------
-    mask_rgb = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    mask_path = out_dir / f"mask_{image_path.stem}.jpg"
-    cv2.imwrite(str(mask_path), mask_rgb)
+    # ── Step 3: Vertical link mask ──────────────────────────────────────────
+    logger.info("─── Step 3: Subtract wire → vertical link mask")
+    vert_mask = get_vertical_link_mask(full_mask, wire_mask)
+    cv2.imwrite(str(save_dir / f"mask_vert_{stem}.jpg"), vert_mask)
 
-    print("\n" + "─" * 50)
-    print(f"  Image   : {image_path.name}")
-    print(f"  Ref     : {result.reference_thickness_px:.1f} px")
-    print(f"  Min     : {result.min_local_thickness_px:.1f} px")
-    print(f"  Wear    : {result.wear_percent:.2f} %")
-    print(f"  Decision: {'❌  REJECT' if result.is_rejected else '✅  PASS'}")
-    print("─" * 50 + "\n")
+    # Green overlay
+    vis_seg = draw_result(img, vert_mask, wire_mask)
+    cv2.imwrite(str(save_dir / f"vert_{stem}.jpg"), vis_seg)
+
+    # ── Step 4: Perspective correction (tilt removal) ──────────────────────
+    logger.info("─── Step 4: Perspective correction (tilt removal)")
+    try:
+        img_rect, mask_rect, tilt_info = correct_tilt(img, vert_mask)
+        cv2.imwrite(str(save_dir / f"rect_{stem}.jpg"), img_rect)
+        logger.info(
+            f"  θ={tilt_info['theta_deg']:.2f}°  "
+            f"d_top={tilt_info['d_top']:.1f}px  d_bot={tilt_info['d_bot']:.1f}px  "
+            f"→ d_target={tilt_info['d_target']:.1f}px"
+        )
+    except Exception as e:
+        logger.warning(f"Tilt correction failed ({e}) — using original image")
+        img_rect, mask_rect, tilt_info = img, vert_mask, {}
+
+    # ── Step 5: Reconstruction ──────────────────────────────────────────────
+    logger.info("─── Step 5: Reconstruction → d measurement + arc fit")
+    results, vis_recon = reconstruct_links(
+        image     = img_rect,
+        vert_mask = mask_rect,
+    )
+    cv2.imwrite(str(save_dir / f"recon_{stem}.jpg"), vis_recon)
+
+    elapsed = time.time() - t0
+
+    # ── Report ──────────────────────────────────────────────────────────────
+    sep = "─" * 62
+    lines = [
+        sep,
+        f"  Image    : {args.image}",
+        f"  SAM used : {not args.skip_sam}",
+        f"  Elapsed  : {elapsed:.1f} s",
+        sep,
+    ]
+    if tilt_info:
+        lines += [
+            f"  Tilt     : θ = {tilt_info['theta_deg']:.2f}°",
+            f"  Before   : d_top={tilt_info['d_top']:.1f}px  d_bot={tilt_info['d_bot']:.1f}px  "
+            f"diff={abs(tilt_info['d_top']-tilt_info['d_bot']):.1f}px",
+            f"  After    : d_top = d_bot = {tilt_info['d_target']:.1f}px",
+            sep,
+        ]
+    lines += [
+        f"  {'Link':>4}  {'d_top (px)':>12}  {'d_bot (px)':>12}  {'d_mean (px)':>12}",
+        sep,
+    ]
+    for r in results:
+        d_top  = r.get("d_top_px",  r.get("d_px", 0.0))
+        d_bot  = r.get("d_bot_px",  r.get("d_px", 0.0))
+        d_mean = r.get("d_mean_px", r.get("d_px", 0.0))
+        lines.append(
+            f"  {r['link_id']+1:>4}  {d_top:>12.1f}  {d_bot:>12.1f}  {d_mean:>12.1f}"
+        )
+    lines.append(sep)
+    report = "\n".join(lines)
+    print("\n" + report + "\n")
+
+    report_path = save_dir / "report.txt"
+    report_path.write_text(report + "\n")
+    logger.info(f"Report saved: {report_path}")
+    logger.info(f"All outputs in: {save_dir}/")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Offline chain inspection test")
-    parser.add_argument("--image", required=True, help="Path to chain image")
-    parser.add_argument("--reject-threshold", type=float, default=0.10)
-    args = parser.parse_args()
-    run(Path(args.image), args.reject_threshold)
+    main()

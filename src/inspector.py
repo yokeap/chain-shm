@@ -59,126 +59,66 @@ class InspectionResult:
 
 class ChainSegmenter:
     """
-    Wraps FastSAM to produce a binary mask of the chain body.
-
-    Mask selection uses geometric scoring (not largest-area) to robustly
-    identify the chain regardless of mask ordering across frames:
-      S1: area coverage  – prefer ~30% of image
-      S2: center-of-mass – chain is always near image center
-      S3: elongation     – chain bounding box is wider than tall
-    Final score = S1 × S2 × S3  (multiplicative: all criteria must pass)
+    YOLOv8n-seg fine-tuned on chain dataset.
+    Inference: ~34ms on Jetson Orin NX via TensorRT engine.
+    
+    Model: chain_seg_best.engine (TensorRT FP16)
+    Dataset: chain-detection Roboflow (210 images, mAP50-mask=0.978)
     """
 
-    MODEL_VARIANTS = {
-        "small": "FastSAM-s.pt",
-        "x":     "FastSAM-x.pt",
-    }
-
-    def __init__(self, variant: str = "small", conf: float = 0.4, iou: float = 0.9):
-        from ultralytics import FastSAM
-        model_name = self.MODEL_VARIANTS.get(variant, "FastSAM-s.pt")
-        logger.info(f"Loading FastSAM model: {model_name}")
-        self.model = FastSAM(model_name)
+    def __init__(
+        self,
+        model_path: str = "chain_seg_best.engine",
+        conf: float = 0.5,
+        task: str = "segment",
+    ):
+        from ultralytics import YOLO
+        import logging
+        logger.info(f"Loading segmentation model: {model_path}")
+        self.model = YOLO(model_path, task=task)
         self.conf  = conf
-        self.iou   = iou
+
+        # Warmup — eliminates 49s first-inference JIT penalty
+        logger.info("Warming up...")
+        import numpy as np
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        for _ in range(3):
+            self.model(dummy, verbose=False)
+        logger.info("Ready")
 
     def segment(self, image: np.ndarray) -> np.ndarray:
-        """Returns binary uint8 mask (255 = chain, 0 = background)."""
+        """
+        Returns binary uint8 mask (255=chain, 0=background).
+        Selects highest-confidence mask if multiple detected.
+        """
         h, w = image.shape[:2]
+
         results = self.model(
             image,
-            device="cuda" if self._has_cuda() else "cpu",
-            retina_masks=True,
-            # imgsz=max(h, w),
-            imgsz=640,
-            conf=self.conf,
-            iou=self.iou,
-            verbose=False,
+            imgsz   = 640,
+            conf    = self.conf,
+            verbose = False,
         )
 
         if results[0].masks is None:
-            logger.warning("FastSAM returned no masks – returning empty mask")
+            logger.warning("No mask detected — returning empty mask")
             return np.zeros((h, w), dtype=np.uint8)
 
-        # Resize all masks back to original resolution
-        candidates = []
-        for m in results[0].masks.data:
-            mr = cv2.resize(
-                m.cpu().numpy().astype(np.uint8),
-                (w, h),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            candidates.append(mr)
-
-        best = self._select_chain_mask(candidates, h, w)
-        return (best * 255).astype(np.uint8)
-
-    @staticmethod
-    def _select_chain_mask(
-        candidates: list,
-        h: int,
-        w: int,
-        area_min: float = 0.10,
-        area_max: float = 0.70,
-        center_tol: float = 0.30,
-    ) -> np.ndarray:
-        image_area = h * w
-        best_score = -1.0
-        best_mask  = candidates[0]
-
-        for mask in candidates:
-            ratio = mask.sum() / image_area
-
-            # Hard filter: background (>70%) and tiny fragments (<10%)
-            if ratio < area_min or ratio > area_max:
-                continue
-
-            ys, xs = np.where(mask > 0)
-            if len(xs) == 0:
-                continue
-
-            # S1: area score – peak at 30% coverage
-            s1 = max(0.0, 1.0 - abs(ratio - 0.30) / 0.30)
-
-            # S2: center-of-mass proximity to image center
-            cx = xs.mean() / w
-            cy = ys.mean() / h
-            dist = np.sqrt((cx - 0.5) ** 2 + (cy - 0.5) ** 2)
-            s2 = max(0.0, 1.0 - dist / center_tol)
-
-            # S3: elongation – chain bounding box wider than tall
-            bbox_w = int(xs.max() - xs.min() + 1)
-            bbox_h = int(ys.max() - ys.min() + 1)
-            aspect = bbox_w / (bbox_h + 1e-6)
-            s3 = min(aspect / (w / h), 1.0)
-
-            score = s1 * s2 * s3
-            logger.debug(
-                f"area={ratio:.2f} cx={cx:.2f} cy={cy:.2f} "
-                f"aspect={aspect:.1f} → score={score:.3f}"
-            )
-
-            if score > best_score:
-                best_score = score
-                best_mask  = mask
-                logger.info(f"→ New best mask: area={ratio:.2f} score={score:.3f}")
-
-        if best_score < 0:
-            logger.warning("No mask passed geometric filter – using largest area")
-            best_mask = max(candidates, key=lambda m: m.sum())
-
-        return best_mask
-
-    @staticmethod
-    def _has_cuda() -> bool:
-        try:
-            import torch
-            return torch.cuda.is_available()
-        except ImportError:
-            return False
+        # เลือก mask ที่มี confidence สูงสุด
+        boxes = results[0].boxes
+        best_idx = int(boxes.conf.argmax())
+        
+        mask_raw = results[0].masks.data[best_idx].cpu().numpy()
+        mask_resized = cv2.resize(
+            mask_raw.astype(np.uint8),
+            (w, h),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        return (mask_resized * 255).astype(np.uint8)
 
     @staticmethod
     def _keep_largest_blob(mask: np.ndarray) -> np.ndarray:
+        from skimage.measure import label, regionprops
         lbl = label(mask > 0)
         if lbl.max() == 0:
             return mask
