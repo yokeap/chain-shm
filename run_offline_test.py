@@ -1,22 +1,9 @@
 """
 run_offline_test.py
 ===================
-Pipeline: seg → reconstruct → horizontal wire → wear analysis
+Pipeline: seg → reconstruct → horizontal wire → area-based wear
 
-Usage
------
-    python3 run_offline_test.py --image chain.png --model sam_b.pt
-    python3 run_offline_test.py --image chain.png --skip-sam
-
-Outputs (debug_seg/)
---------------------
-    mask_full_<s>.jpg   full chain mask
-    mask_wire_<s>.jpg   horizontal wire mask
-    mask_vert_<s>.jpg   vertical link mask
-    recon_<s>.jpg       d measurement + arcs (detail)
-    hwire_<s>.jpg       horizontal wire model (detail)
-    full_recon_<s>.jpg  clean combined overlay
-    report.txt          summary
+Usage:  python3 run_offline_test.py --image chain.png --model sam_b.pt
 """
 
 import argparse, logging, sys, time
@@ -36,27 +23,22 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
-# ────────────────────────────────────────────────────────────────
 def get_wire_mask_simple(gray, full_mask):
     h, w = gray.shape
-    row_means = []
-    for y in range(h):
-        px = gray[y, full_mask[y, :] > 0]
-        row_means.append(float(px.mean()) if len(px) else 255.0)
-    row_means = np.array(row_means)
-    thresh = np.percentile(row_means, 15)
-    wire_rows = np.where(row_means < thresh)[0]
+    rm = [float(gray[y, full_mask[y]>0].mean()) if (full_mask[y]>0).any() else 255.0
+          for y in range(h)]
+    rm = np.array(rm)
+    thr = np.percentile(rm, 15)
+    rows = np.where(rm < thr)[0]
     mask = np.zeros((h, w), dtype=np.uint8)
-    if len(wire_rows):
-        y1 = max(0, int(wire_rows[0]) - 5)
-        y2 = min(h-1, int(wire_rows[-1]) + 5)
-        mask[y1:y2+1, :] = full_mask[y1:y2+1, :]
+    if len(rows):
+        y1, y2 = max(0, int(rows[0])-5), min(h-1, int(rows[-1])+5)
+        mask[y1:y2+1] = full_mask[y1:y2+1]
     return mask
 
 
-# ────────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Chain wear analysis pipeline")
+    ap = argparse.ArgumentParser(description="Chain wear analysis")
     ap.add_argument("--image",     required=True)
     ap.add_argument("--model",     default="sam_b.pt")
     ap.add_argument("--skip-sam",  action="store_true")
@@ -72,72 +54,70 @@ def main():
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     stem = Path(args.image).stem
 
-    # Step 1 — full mask
+    # Step 1
     logger.info("── Step 1: full chain mask")
     full_mask = get_full_mask(gray)
     cv2.imwrite(str(save / f"mask_full_{stem}.jpg"), full_mask)
 
-    # Step 2 — wire mask
+    # Step 2
     if args.skip_sam:
-        logger.info("── Step 2: simple wire mask (no SAM)")
+        logger.info("── Step 2: simple wire mask")
         wire_mask = get_wire_mask_simple(gray, full_mask)
     else:
         logger.info("── Step 2: SAM → wire mask")
         wire_mask = get_wire_mask_sam(img, full_mask, args.model)
     cv2.imwrite(str(save / f"mask_wire_{stem}.jpg"), wire_mask)
 
-    # Step 3 — vertical link mask
+    # Step 3
     logger.info("── Step 3: vertical link mask")
     vert_mask = get_vertical_link_mask(full_mask, wire_mask)
     cv2.imwrite(str(save / f"mask_vert_{stem}.jpg"), vert_mask)
 
-    # Step 4 — perspective correction
+    # Step 4
     logger.info("── Step 4: perspective correction")
     try:
         img_rect, mask_rect, tilt_info = correct_tilt(img, vert_mask)
         cv2.imwrite(str(save / f"rect_{stem}.jpg"), img_rect)
     except Exception as e:
-        logger.warning(f"Tilt correction failed ({e})")
+        logger.warning(f"Tilt failed ({e})")
         img_rect, mask_rect, tilt_info = img, vert_mask, {}
 
-    # Step 5 — reconstruction (d measurement)
+    # Step 5
     logger.info("── Step 5: reconstruction → d")
     results, vis_recon = reconstruct_links(img_rect, mask_rect)
     cv2.imwrite(str(save / f"recon_{stem}.jpg"), vis_recon)
 
-    # Step 6 — horizontal wire model (b measurement)
+    # Step 6
     logger.info("── Step 6: horizontal wire → b")
     try:
         hw = model_horizontal_wire(wire_mask)
         vis_hw = draw_horizontal_wire(img, hw, wire_mask)
         cv2.imwrite(str(save / f"hwire_{stem}.jpg"), vis_hw)
     except Exception as e:
-        logger.warning(f"Horizontal wire failed ({e})")
-        hw = {"segments": [], "b_mean_px": 0.0}
+        logger.warning(f"H-wire failed ({e})")
+        hw = {"segments": [], "b_mean_px": 0}
 
-    # Step 7 — wear analysis (gap measurement)
-    logger.info("── Step 7: wear analysis → gap")
+    # Step 7
+    logger.info("── Step 7: wear analysis (area-based)")
     try:
-        wear = compute_wear(results, hw)
+        wear = compute_wear(results, hw, image_shape=img.shape[:2],
+                            vert_mask=full_mask)
     except Exception as e:
-        logger.warning(f"Wear analysis failed ({e})")
+        logger.warning(f"Wear failed ({e})")
         wear = {"pairs": [], "d_mean_px": 0, "b_mean_px": 0,
-                "gap_left": 0, "gap_right": 0,
                 "wear_pct_left": 0, "wear_pct_right": 0}
 
-    # Step 8 — full reconstruction overlay (clean)
+    # Step 8
     logger.info("── Step 8: full_recon overlay")
-    vis_full = draw_full_recon(img, results, hw, wear)
+    vis_full = draw_full_recon(img, results, hw, wear, vert_mask=full_mask)
     cv2.imwrite(str(save / f"full_recon_{stem}.jpg"), vis_full)
 
     elapsed = time.time() - t0
 
     # ── Report ──
     sep = "─" * 52
-    d_mean = results[0].get("d_mean_px", 0) if results else 0
-    b_mean = hw.get("b_mean_px", 0)
-    gl = wear.get("gap_left", 0)
-    gr = wear.get("gap_right", 0)
+    d = results[0].get("d_mean_px", 0) if results else 0
+    b = hw.get("b_mean_px", 0)
     wl = wear.get("wear_pct_left", 0)
     wr = wear.get("wear_pct_right", 0)
 
@@ -146,16 +126,17 @@ def main():
         f"  Image   : {args.image}",
         f"  Elapsed : {elapsed:.1f}s",
         sep,
-        f"  d (vertical link)    = {d_mean:.1f} px",
-        f"  b (horizontal wire)  = {b_mean:.1f} px",
+        f"  d (vertical)   = {d:.1f} px",
+        f"  b (horizontal) = {b:.1f} px",
         sep,
-        f"  gap left  = {gl:+.1f} px   wear = {wl:.1f}%",
-        f"  gap right = {gr:+.1f} px   wear = {wr:.1f}%",
-        sep,
+        f"  Wear (area-based)",
     ]
-
-    if tilt_info:
-        lines.insert(3, f"  Tilt     : θ = {tilt_info.get('theta_deg',0):.2f}°")
+    for p in wear.get("pairs", []):
+        lines.append(
+            f"    {p['side']:>5}: {p['wear_pct']:.1f}%  "
+            f"({p['interf_area']}px²/{p['cs_area']}px²)"
+        )
+    lines.append(sep)
 
     report = "\n".join(lines)
     print("\n" + report + "\n")
