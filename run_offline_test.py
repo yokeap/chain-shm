@@ -109,7 +109,7 @@ def main():
 
     # Step 8
     logger.info("── Step 8: full_recon overlay")
-    vis_full = draw_full_recon(img, results, hw, wear, vert_mask=full_mask)
+    vis_full = draw_full_recon(img_rect, results, hw, wear, vert_mask=full_mask)
     cv2.imwrite(str(save / f"full_recon_{stem}.jpg"), vis_full)
 
     elapsed = time.time() - t0
