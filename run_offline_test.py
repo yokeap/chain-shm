@@ -1,9 +1,8 @@
 """
 run_offline_test.py
 ===================
-Pipeline: seg → reconstruct → horizontal wire → area-based wear
-
-Usage:  python3 run_offline_test.py --image chain.png --model sam_b.pt
+Pipeline: seg → tilt correction → h-wire → horizontal correction
+        → reconstruction → wear analysis (1D)
 """
 
 import argparse, logging, sys, time
@@ -11,11 +10,12 @@ from pathlib import Path
 import cv2, numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-from vertical_link_seg     import get_full_mask, get_wire_mask_sam, get_vertical_link_mask, draw_result
-from perspective_correction import correct_tilt
-from reconstruction         import reconstruct_links
-from horizontal_chain       import model_horizontal_wire, draw_horizontal_wire
-from wear_analysis          import compute_wear, draw_full_recon
+from vertical_link_seg      import get_full_mask, get_wire_mask_sam, get_vertical_link_mask, draw_result
+from perspective_correction  import correct_tilt
+from horizontal_chain        import model_horizontal_wire, draw_horizontal_wire
+from horizontal_correction   import correct_horizontal_perspective
+from reconstruction          import reconstruct_links
+from wear_analysis           import compute_wear, draw_full_recon
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s | %(levelname)-8s | %(message)s",
@@ -73,14 +73,37 @@ def main():
     vert_mask = get_vertical_link_mask(full_mask, wire_mask)
     cv2.imwrite(str(save / f"mask_vert_{stem}.jpg"), vert_mask)
 
-    # Step 4
-    logger.info("── Step 4: perspective correction")
+    # Step 4a
+    logger.info("── Step 4a: vertical tilt correction")
     try:
         img_rect, mask_rect, tilt_info = correct_tilt(img, vert_mask)
         cv2.imwrite(str(save / f"rect_{stem}.jpg"), img_rect)
     except Exception as e:
         logger.warning(f"Tilt failed ({e})")
         img_rect, mask_rect, tilt_info = img, vert_mask, {}
+
+    # Step 4b
+    logger.info("── Step 4b: horizontal perspective correction")
+    try:
+        hw_pre = model_horizontal_wire(wire_mask)
+        img_hcorr, H_mat, wire_mask_corr, hcorr_info = \
+            correct_horizontal_perspective(img_rect, hw_pre, mask=wire_mask)
+        if hcorr_info.get("b_diff_pct", 0) > 2.0:
+            logger.info(f"  Applying h-correction: b_diff={hcorr_info['b_diff']:.1f}px "
+                        f"({hcorr_info['b_diff_pct']:.1f}%)")
+            img_rect = img_hcorr
+            if wire_mask_corr is not None:
+                wire_mask = wire_mask_corr
+            h_img, w_img = img_rect.shape[:2]
+            mask_rect = cv2.warpPerspective(mask_rect, H_mat, (w_img, h_img),
+                                            flags=cv2.INTER_NEAREST)
+            full_mask = cv2.warpPerspective(full_mask, H_mat, (w_img, h_img),
+                                            flags=cv2.INTER_NEAREST)
+            cv2.imwrite(str(save / f"hcorr_{stem}.jpg"), img_rect)
+        else:
+            logger.info(f"  Skipping h-correction (b_diff < 2%)")
+    except Exception as e:
+        logger.warning(f"H-correction failed ({e})")
 
     # Step 5
     logger.info("── Step 5: reconstruction → d")
@@ -91,16 +114,16 @@ def main():
     logger.info("── Step 6: horizontal wire → b")
     try:
         hw = model_horizontal_wire(wire_mask)
-        vis_hw = draw_horizontal_wire(img, hw, wire_mask)
+        vis_hw = draw_horizontal_wire(img_rect, hw, wire_mask)
         cv2.imwrite(str(save / f"hwire_{stem}.jpg"), vis_hw)
     except Exception as e:
         logger.warning(f"H-wire failed ({e})")
         hw = {"segments": [], "b_mean_px": 0}
 
     # Step 7
-    logger.info("── Step 7: wear analysis (area-based)")
+    logger.info("── Step 7: wear analysis (1D)")
     try:
-        wear = compute_wear(results, hw, image_shape=img.shape[:2],
+        wear = compute_wear(results, hw, image_shape=img_rect.shape[:2],
                             vert_mask=full_mask)
     except Exception as e:
         logger.warning(f"Wear failed ({e})")
@@ -129,12 +152,13 @@ def main():
         f"  d (vertical)   = {d:.1f} px",
         f"  b (horizontal) = {b:.1f} px",
         sep,
-        f"  Wear (area-based)",
+        f"  Wear (1D remaining thickness)",
     ]
     for p in wear.get("pairs", []):
         lines.append(
-            f"    {p['side']:>5}: {p['wear_pct']:.1f}%  "
-            f"({p['interf_area']}px²/{p['cs_area']}px²)"
+            f"    {p['side']:>5}: wear={p['wear_pct']:.1f}%  "
+            f"d_side={p['d_side']:.0f}  remaining={p['remaining']:.0f}  "
+            f"Dw={p['measured_depth']:.1f}px"
         )
     lines.append(sep)
 
