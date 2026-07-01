@@ -127,26 +127,40 @@ def _ctrl_top(comp, x1, x2) -> Dict:
     li = _find_tip(xs, tops, bots, "left")
     ri = _find_tip(xs, tops, bots, "right")
 
-    sm  = uniform_filter1d(bots, size=min(80, len(bots)//4*2+1))
-    contact = np.where(sm <= sm.max() - 8)[0]
-    wli = int(contact[0])  if len(contact) else len(xs)//4
-    wri = int(contact[-1]) if len(contact) else 3*len(xs)//4
+    heights = bots - tops
+
+    # ── pt5L / pt5R: where outer arc meets the wire contact zone ──
+    # = column with deepest bottom edge (max of bots) in each half
+    sm_bots = uniform_filter1d(bots, size=min(60, len(bots) // 4 * 2 + 1))
+    half = len(xs) // 2
+    wli = int(np.argmax(sm_bots[:half]))
+    wri = half + int(np.argmax(sm_bots[half:]))
+
+    # ── pt2L / pt2R: inner arc endpoints ──
+    # = first/last column where height exceeds 15% of max (inner arc "opens")
+    h_thresh = max(10.0, heights.max() * 0.15)
+    in_arc = np.where(heights >= h_thresh)[0]
+    p2l_i = int(in_arc[0])  if len(in_arc) else li
+    p2r_i = int(in_arc[-1]) if len(in_arc) else ri
 
     x_apex = (int(xs[li]) + int(xs[ri])) // 2
     ai  = _nearest_idx(xs, x_apex)
-    i6l = _nearest_idx(xs, (int(xs[wli]) + x_apex) // 2)
-    i6r = _nearest_idx(xs, (int(xs[wri]) + x_apex) // 2)
 
-    def pt(i, e): return (int(xs[i]), int(tops[i] if e=="top" else bots[i]))
+    # ── pt6L / pt6R: midpoint between pt2 and pt4 along inner arc ──
+    i6l = _nearest_idx(xs, (int(xs[p2l_i]) + x_apex) // 2)
+    i6r = _nearest_idx(xs, (int(xs[p2r_i]) + x_apex) // 2)
+
+    def pt(i, e): return (int(xs[i]), int(tops[i] if e == "top" else bots[i]))
 
     return {
-        "pt1_left" : pt(li,  "top"),  "pt1_right": pt(ri,  "top"),
-        "pt5_left" : pt(wli, "top"),  "pt5_right": pt(wri, "top"),
-        "pt3"      : pt(ai,  "top"),
-        "pt2_left" : pt(wli, "bot"),  "pt2_right": pt(wri, "bot"),
-        "pt6_left" : pt(i6l, "bot"),  "pt6_right": pt(i6r, "bot"),
-        "pt4"      : pt(ai,  "bot"),
-        "x_apex": x_apex, "x2_left": int(xs[wli]), "x2_right": int(xs[wri]),
+        "pt1_left" : pt(li,    "top"),  "pt1_right": pt(ri,    "top"),
+        "pt5_left" : pt(wli,   "top"),  "pt5_right": pt(wri,   "top"),
+        "pt3"      : pt(ai,    "top"),
+        "pt2_left" : pt(p2l_i, "bot"),  "pt2_right": pt(p2r_i, "bot"),
+        "pt6_left" : pt(i6l,   "bot"),  "pt6_right": pt(i6r,   "bot"),
+        "pt4"      : pt(ai,    "bot"),
+        "x_apex": x_apex,
+        "x2_left": int(xs[wli]), "x2_right": int(xs[wri]),
     }
 
 
@@ -162,27 +176,39 @@ def _ctrl_bot(comp, x1, x2) -> Dict:
     li = _find_tip(xs, tops, bots, "left")
     ri = _find_tip(xs, tops, bots, "right")
 
-    sm   = uniform_filter1d(tops.astype(float), size=30)
-    n    = len(xs)
-    half = n // 2
-    wli  = int(np.argmin(sm[:half]))
-    wri  = half + int(np.argmin(sm[half:]))
+    heights = bots - tops
+
+    # ── pt5L / pt5R: deepest upward dip in each half (wire contact zone) ──
+    sm_tops = uniform_filter1d(tops.astype(float), size=30)
+    half = len(xs) // 2
+    wli  = int(np.argmin(sm_tops[:half]))
+    wri  = half + int(np.argmin(sm_tops[half:]))
+
+    # ── pt2L / pt2R: inner arc endpoints ──
+    # = first/last column where height exceeds 15% of max
+    h_thresh = max(10.0, heights.max() * 0.15)
+    in_arc = np.where(heights >= h_thresh)[0]
+    p2l_i = int(in_arc[0])  if len(in_arc) else li
+    p2r_i = int(in_arc[-1]) if len(in_arc) else ri
 
     x_apex = (int(xs[li]) + int(xs[ri])) // 2
     ai  = _nearest_idx(xs, x_apex)
-    i6l = _nearest_idx(xs, (int(xs[wli]) + x_apex) // 2)
-    i6r = _nearest_idx(xs, (int(xs[wri]) + x_apex) // 2)
+
+    # ── pt6L / pt6R: midpoint between pt2 and pt4 along inner arc ──
+    i6l = _nearest_idx(xs, (int(xs[p2l_i]) + x_apex) // 2)
+    i6r = _nearest_idx(xs, (int(xs[p2r_i]) + x_apex) // 2)
 
     def pt(i, e): return (int(xs[i]), int(tops[i] if e == "top" else bots[i]))
 
     return {
-        "pt1_left" : pt(li,  "bot"),  "pt1_right": pt(ri,  "bot"),
-        "pt5_left" : pt(wli, "bot"),  "pt5_right": pt(wri, "bot"),
-        "pt3"      : pt(ai,  "bot"),
-        "pt2_left" : pt(wli, "top"),  "pt2_right": pt(wri, "top"),
-        "pt6_left" : pt(i6l, "top"),  "pt6_right": pt(i6r, "top"),
-        "pt4"      : pt(ai,  "top"),
-        "x_apex": x_apex, "x2_left": int(xs[wli]), "x2_right": int(xs[wri]),
+        "pt1_left" : pt(li,    "bot"),  "pt1_right": pt(ri,    "bot"),
+        "pt5_left" : pt(wli,   "bot"),  "pt5_right": pt(wri,   "bot"),
+        "pt3"      : pt(ai,    "bot"),
+        "pt2_left" : pt(p2l_i, "top"),  "pt2_right": pt(p2r_i, "top"),
+        "pt6_left" : pt(i6l,   "top"),  "pt6_right": pt(i6r,   "top"),
+        "pt4"      : pt(ai,    "top"),
+        "x_apex": x_apex,
+        "x2_left": int(xs[wli]), "x2_right": int(xs[wri]),
     }
 
 
@@ -349,6 +375,7 @@ def reconstruct_links(
     image    : np.ndarray,
     vert_mask: np.ndarray,
     px_per_mm: float = 1.0,
+    wire_mask: Optional[np.ndarray] = None,
 ) -> Tuple[List[Dict], np.ndarray]:
     _, bw = cv2.threshold(vert_mask, 127, 255, cv2.THRESH_BINARY)
     pairs = _pair_blobs(bw)
