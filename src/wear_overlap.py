@@ -74,6 +74,37 @@ def _poly_ref_x(poly: np.ndarray) -> float:
 # Wear computation
 # ══════════════════════════════════════════════════════════════════
 
+def _normalize_parallax(pairs: List[Dict], frame_w: int) -> Optional[float]:
+    """
+    Remove the systematic left→right wear ramp caused by **wire↔link parallax**.
+
+    The horizontal wire and the vertical links sit at different depths (the wire
+    threads *through* the link, one bar-thickness apart in z).  A camera viewing
+    at an angle therefore sees the wire shifted relative to the links by an amount
+    that grows ~linearly across the frame — so the measured A∩B overlap ramps with
+    the interlock's x-position even though the physical wear along one chain is
+    roughly uniform.  A single homography cannot remove this (it is non-planar).
+
+    We model it as ``wear(x) = wear_center + k·(x − x_c)`` (x_c = frame centre,
+    where parallax ≈ 0), fit ``k`` from the frame's interlocks by least squares,
+    and report each interlock's wear **referenced back to the centre**
+    (``wear_corr``).  Needs ≥2 interlocks; with one, no correction is possible.
+
+    Returns the fitted slope ``k`` (%/px) or ``None``.
+    """
+    if len(pairs) < 2:
+        for p in pairs:
+            p["wear_corr"] = p["wear_pct"]
+        return None
+    xc = frame_w / 2.0
+    xs = np.array([float(p["circle"]["center"][0]) - xc for p in pairs])
+    ws = np.array([float(p["wear_pct"]) for p in pairs])
+    k = float(np.polyfit(xs, ws, 1)[0])           # slope of wear vs (x − centre)
+    for p, dx in zip(pairs, xs):
+        p["wear_corr"] = float(p["wear_pct"] - k * dx)   # wear at frame centre
+    return k
+
+
 def compute_wear(link: Optional[Dict], wire: Dict, shape) -> Dict:
     """
     Compute wear = area(A∩B)/area(A)×100, **anchored on the horizontal wire**.
@@ -145,11 +176,11 @@ def compute_wear(link: Optional[Dict], wire: Dict, shape) -> Dict:
         area_B = int(B_mask.sum() // 255)
         over   = cv2.bitwise_and(a["A_mask"], B_mask)
         area_over = int(over.sum() // 255)
-        wear_pct  = 100.0 * area_over / max(1, a["area_A"])
+        wear_pct  = 100.0 * area_over / max(1, a["area_A"])   # raw geometric ratio
 
         logger.info(
-            f"  wear {side} cap (crescent {key}): A={a['area_A']}px²  "
-            f"B={area_B}px²  A∩B={area_over}px²  wear={wear_pct:.1f}%"
+            f"  wear {side} cap (crescent {key}): cap_x={float(c['center'][0]):.0f}  "
+            f"A={a['area_A']}px²  B={area_B}px²  A∩B={area_over}px²  wear={wear_pct:.1f}%"
         )
 
         pairs.append({
@@ -164,13 +195,30 @@ def compute_wear(link: Optional[Dict], wire: Dict, shape) -> Dict:
         if i not in used_circ:
             logger.warning(f"  wear {c.get('side','?')} cap: no crescent A to press into (N/A)")
 
+    # ── parallax normalization: flatten the left→right ramp (see helper) ──
+    h, w = shape
+    k_par = _normalize_parallax(pairs, w)
+    if k_par is not None:
+        logger.info(f"  parallax slope k={k_par*1000:.2f}%/1000px  → "
+                    f"wear referenced to frame centre (x={w//2})")
+
     def _by_side(s):
         return next((p["wear_pct"] for p in pairs if p["side"] == s), None)
+
+    # sample-level headline = worst (deepest) interlock, mirroring the caliper
+    wear_raw_max = max((p["wear_pct"] for p in pairs), default=None)
+    # parallax-corrected: interlocks now agree, so the frame-centre value is the
+    # single representative wear (mean of the corrected per-interlock values)
+    corr = [p["wear_corr"] for p in pairs if "wear_corr" in p]
+    wear_corr_mean = float(np.mean(corr)) if corr else None
 
     return {
         "pairs": pairs,
         "wear_pct_left":  _by_side("left"),
         "wear_pct_right": _by_side("right"),
+        "wear_raw_max": wear_raw_max,
+        "wear_corr_mean": wear_corr_mean,
+        "parallax_k": k_par,
         "d_mean_px": link.get("d_mean_px", 0.0),
         "b_px": wire.get("b_px", 0.0),
     }

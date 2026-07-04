@@ -195,14 +195,24 @@ def main():
         f"(wire_full={trig['wire_full']}, interlock={trig['has_interlock']})",
         f"            {trig['reason']}",
         sep,
-        f"  Wear = area(A∩B) / area(A)"
+        f"  Wear = area(A∩B) / area(A)   [raw | parallax-corrected to frame centre]"
         + ("" if trig["triggered"] else "   [advisory — frame not triggered]"),
     ]
     if wear.get("pairs"):
         for p in wear["pairs"]:
+            wc = p.get("wear_corr")
+            wc_s = f"{wc:5.1f}%" if wc is not None else "  n/a"
             lines.append(
-                f"    {p['side']:>5}: {p['wear_pct']:5.1f}%   "
-                f"(A={p['area_A']}px²  B={p['area_B']}px²  A∩B={p['area_overlap']}px²)")
+                f"    {p['side']:>5} @x={int(p['circle']['center'][0]):>4}: "
+                f"raw={p['wear_pct']:5.1f}%  corr={wc_s}   "
+                f"(A={p['area_A']}  B={p['area_B']}  A∩B={p['area_overlap']})")
+        km = wear.get("parallax_k"); wcm = wear.get("wear_corr_mean")
+        lines.append(sep)
+        if wcm is not None:
+            lines.append(f"  Parallax slope  : {km*1000:+.2f}%/1000px  (left→right ramp removed)")
+            lines.append(f"  WEAR (corrected): {wcm:.1f}%   [frame-centre, parallax-free]")
+        else:
+            lines.append("  WEAR: single interlock — parallax not separable (raw reported)")
     else:
         lines.append("    (no A/B pairs measured)")
     lines.append(sep)
