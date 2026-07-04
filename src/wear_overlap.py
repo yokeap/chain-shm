@@ -14,7 +14,9 @@ has worn, the two reconstructions interpenetrate, and that overlap — as a frac
 of the link crescent A — is the wear proxy.  A larger circle B pushing deeper into
 crescent A ⇒ larger overlap ⇒ higher wear.
 
-Each vertical-link side (left/right) is paired with the nearest wire circle B (by x).
+Each vertical-link crescent A is paired with the wire cap B *inserted into it* —
+the cap whose x-span overlaps the crescent's (same interlock) — assigned greedily,
+closest first.  A crescent whose interlock partner is off-frame reports N/A.
 
 Usage
 -----
@@ -74,7 +76,15 @@ def _poly_ref_x(poly: np.ndarray) -> float:
 
 def compute_wear(link: Optional[Dict], wire: Dict, shape) -> Dict:
     """
-    Compute per-side wear = area(A∩B)/area(A)×100.
+    Compute wear = area(A∩B)/area(A)×100, **anchored on the horizontal wire**.
+
+    The wire link is the reference: each of its caps (circle **B**) presses into
+    the flat-link crescent (**area A**) it is inserted into.  We therefore iterate
+    over the wire's caps and, for each, pick the crescent whose x-span the cap
+    overlaps — pooling crescents from *every* flat link (``sides`` +
+    ``extra_sides``) so both the left cap (→ left flat link) and the right cap
+    (→ right flat link) are measured symmetrically.  Results are labelled by the
+    **cap** side (left/right of the wire).
 
     Parameters
     ----------
@@ -88,53 +98,71 @@ def compute_wear(link: Optional[Dict], wire: Dict, shape) -> Dict:
     """
     empty = {"pairs": [], "wear_pct_left": None, "wear_pct_right": None,
              "d_mean_px": 0.0, "b_px": wire.get("b_px", 0.0)}
-    if link is None or not link.get("sides"):
+    if link is None:
         return empty
 
     circles = list(wire.get("circles", []))
-    pairs: List[Dict] = []
-    used = set()
 
-    for side, sd in link["sides"].items():
-        A_poly = sd["area_A_poly"]
+    # ── Pool crescents A from every flat link (primary + extras) ──────────
+    crescents: Dict[str, Dict] = {}
+    crescents.update(link.get("sides", {}))
+    crescents.update(link.get("extra_sides", {}))
+
+    cres: Dict[str, Dict] = {}
+    for key, sd in crescents.items():
+        A_poly = sd.get("area_A_poly")
+        if A_poly is None or len(A_poly) < 3:
+            continue
         A_mask = _poly_mask(A_poly, shape)
         area_A = int(A_mask.sum() // 255)
         if area_A == 0:
-            logger.warning(f"  wear {side}: area A is empty, skipping")
             continue
+        cres[key] = {"A_poly": A_poly, "A_mask": A_mask, "area_A": area_A,
+                     "ref_x": _poly_ref_x(A_poly),
+                     "ax0": float(A_poly[:, 0].min()), "ax1": float(A_poly[:, 0].max())}
 
-        # Pair with nearest unused circle B by x.
-        ref_x = _poly_ref_x(A_poly)
-        best, bi, bd = None, -1, float("inf")
-        for i, c in enumerate(circles):
-            if i in used:
-                continue
-            dd = abs(float(c["center"][0]) - ref_x)
-            if dd < bd:
-                bd, best, bi = dd, c, i
-        if best is None:
-            logger.warning(f"  wear {side}: no wire circle B to pair with")
+    # ── For each cap B, find the crescent A it is inserted into (x-span overlap),
+    #    assign greedily closest-first, one crescent per cap ──
+    cand = []   # (center-distance, circle_index, crescent_key)
+    for i, c in enumerate(circles):
+        cx, r = float(c["center"][0]), float(c["radius"])
+        for key, a in cres.items():
+            if cx + r < a["ax0"] or cx - r > a["ax1"]:
+                continue                      # cap not inserted into this crescent
+            cand.append((abs(cx - a["ref_x"]), i, key))
+    cand.sort()
+
+    pairs: List[Dict] = []
+    used_circ, used_cres = set(), set()
+    for _, i, key in cand:
+        if i in used_circ or key in used_cres:
             continue
-        used.add(bi)
+        used_circ.add(i); used_cres.add(key)
+        c = circles[i]; a = cres[key]
+        side = c.get("side", "?")            # label by the CAP side (wire anchor)
 
-        B_mask = _circle_mask(best["center"], best["radius"], shape)
+        B_mask = _circle_mask(c["center"], c["radius"], shape)
         area_B = int(B_mask.sum() // 255)
-        over   = cv2.bitwise_and(A_mask, B_mask)
+        over   = cv2.bitwise_and(a["A_mask"], B_mask)
         area_over = int(over.sum() // 255)
-        wear_pct  = 100.0 * area_over / max(1, area_A)
+        wear_pct  = 100.0 * area_over / max(1, a["area_A"])
 
         logger.info(
-            f"  wear {side}: A={area_A}px²  B={area_B}px²  "
-            f"A∩B={area_over}px²  wear={wear_pct:.1f}%"
+            f"  wear {side} cap (crescent {key}): A={a['area_A']}px²  "
+            f"B={area_B}px²  A∩B={area_over}px²  wear={wear_pct:.1f}%"
         )
 
         pairs.append({
-            "side": side,
-            "area_A": area_A, "area_B": area_B, "area_overlap": area_over,
+            "side": side, "crescent": key,
+            "area_A": a["area_A"], "area_B": area_B, "area_overlap": area_over,
             "wear_pct": wear_pct,
-            "A_poly": A_poly, "circle": best,
+            "A_poly": a["A_poly"], "circle": c,
             "overlap_mask": over,
         })
+
+    for i, c in enumerate(circles):
+        if i not in used_circ:
+            logger.warning(f"  wear {c.get('side','?')} cap: no crescent A to press into (N/A)")
 
     def _by_side(s):
         return next((p["wear_pct"] for p in pairs if p["side"] == s), None)
@@ -191,7 +219,8 @@ def draw_overlay(image: np.ndarray, link: Optional[Dict], wire: Dict,
             vis = cv2.addWeighted(vis, 1.0, ov2, 0.55, 0)
 
     # 2. Per-side arcs (blue outer, red inner) + labelled points 1-8
-    for side, sd in link["sides"].items():
+    #    (primary link + every extra flat link's crescents)
+    for side, sd in {**link.get("sides", {}), **link.get("extra_sides", {})}.items():
         _dashed(vis, sd["outer_pts"], BLUE, 2, seg=12, gap=8)
         _dashed(vis, sd["inner_pts"], RED,  2, seg=10, gap=8)
         lm = sd["labels"]
@@ -211,16 +240,20 @@ def draw_overlay(image: np.ndarray, link: Optional[Dict], wire: Dict,
     _dot(vis, p9, YELLOW, 7, "9"); _dot(vis, p10, YELLOW, 7, "10")
     _dot(vis, p11, YELLOW, 7, "11"); _dot(vis, p12, YELLOW, 7, "12")
 
-    # 4. Wire: circle B, tip (point 1), thickness b
-    for seg in wire.get("segments", []):
-        cv2.line(vis, seg["top_line"][0], seg["top_line"][1], RED, 2, cv2.LINE_AA)
-        cv2.line(vis, seg["bot_line"][0], seg["bot_line"][1], RED, 2, cv2.LINE_AA)
+    # 4. Wire: straight edges, circle B, tip (point 1), pt2 corners, thickness b
+    if wire.get("top_line") and wire.get("bot_line"):
+        cv2.line(vis, wire["top_line"][0], wire["top_line"][1], RED, 2, cv2.LINE_AA)
+        cv2.line(vis, wire["bot_line"][0], wire["bot_line"][1], RED, 2, cv2.LINE_AA)
+    for cn in wire.get("corners", []):
+        _dot(vis, cn["pt"], YELLOW, 6, "2")
     for c in wire.get("circles", []):
         cx, cy = int(c["center"][0]), int(c["center"][1]); r = int(round(c["radius"]))
         cv2.circle(vis, (cx, cy), r, GREEN, 2, cv2.LINE_AA)
         cv2.line(vis, (cx, cy - r), (cx, cy + r), YELLOW, 2, cv2.LINE_AA)
         _dot(vis, c["tip"], YELLOW, 7, "1")
         cv2.putText(vis, "B", (cx - 8, cy + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, MAGENTA, 2, cv2.LINE_AA)
+        cv2.putText(vis, f"area B={c.get('area_B_px', 0):.0f}px2", (cx - r, cy + r + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, GREEN, 2, cv2.LINE_AA)
 
     # 5. Per-side wear labels near the overlap
     for p in wear.get("pairs", []):
@@ -230,17 +263,200 @@ def draw_overlay(image: np.ndarray, link: Optional[Dict], wire: Dict,
 
     # 6. Summary banner
     wl = wear.get("wear_pct_left"); wr = wear.get("wear_pct_right")
+    trig = wear.get("trigger") or {}
+    tflag = "TRIGGERED" if trig.get("triggered") else "NOT TRIGGERED"
     lines = [
         f"d={wear.get('d_mean_px', 0):.0f}px  b={wear.get('b_px', 0):.0f}px",
         f"wear  L={_fmt(wl)}  R={_fmt(wr)}",
+        f"[{tflag}] {trig.get('reason', '')}",
     ]
-    py = max(20, link.get("top_y1", 40) - 50)
+    py = max(20, link.get("top_y1", 40) - 74)
     for i, ln in enumerate(lines):
         y = py + i * 24
-        cv2.rectangle(vis, (8, y - 16), (360, y + 6), (20, 20, 20), -1)
-        cv2.putText(vis, ln, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, WHITE, 2, cv2.LINE_AA)
+        col = (GREEN if trig.get("triggered") else ORANGE) if i == 2 else WHITE
+        cv2.rectangle(vis, (8, y - 16), (8 + 11 * len(ln), y + 6), (20, 20, 20), -1)
+        cv2.putText(vis, ln, (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, 2, cv2.LINE_AA)
     return vis
 
 
 def _fmt(v):
     return "n/a" if v is None else f"{v:.1f}%"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Trigger gate
+# ══════════════════════════════════════════════════════════════════
+
+def evaluate_trigger(link: Optional[Dict], wire: Dict, wear: Dict) -> Dict:
+    """
+    Decide whether this frame yields a measurement.
+
+    A single **interlock** is all that is required: a real wire cap (area B,
+    already frame-cut-rejected by ``model_wire``) inserted into a reconstructable
+    crescent (area A).  That joint is self-contained, so it can be measured
+    **regardless of whether the whole wire link or the whole flat link is fully
+    in-frame** — the surrounding links may run off the frame edge.  We therefore
+    fire on *any* complete interlock.
+
+    ``wire_full`` and ``n_links`` are still reported as **confidence context**
+    (a fully-visible wire link gives both interlocks; a cut one gives a single
+    one) but they no longer gate the measurement.
+
+    Returns
+    -------
+    dict: triggered(bool), wire_full(bool), has_interlock(bool),
+          n_interlocks(int), reason(str)
+    """
+    n = len(wear.get("pairs", []))
+    triggered = n > 0
+    wire_full = bool(wire and wire.get("full"))
+    n_caps = len(wire.get("circles", [])) if wire else 0
+
+    if triggered:
+        reason = f"{n} interlock(s) measured" + ("" if wire_full else " (wire cut - partial view)")
+    elif n_caps == 0:
+        reason = "no horizontal wire cap detected"
+    elif link is None:
+        reason = "no vertical crescent detected"
+    else:
+        reason = "wire cap present but not inserted into any crescent"
+
+    return {"triggered": triggered, "wire_full": wire_full,
+            "has_interlock": triggered, "n_interlocks": n, "reason": reason}
+
+
+# ══════════════════════════════════════════════════════════════════
+# Full reconstruction mask — the clean A / B / A∩B schematic
+# ══════════════════════════════════════════════════════════════════
+
+def draw_full_recon_mask(link: Optional[Dict], wire: Dict, wear: Dict,
+                         shape) -> np.ndarray:
+    """
+    Render the *reconstruction* on a dark canvas (not the photo): every
+    vertical-link crescent **area A** (blue), every wire cap **area B** (green),
+    and the measured **A∩B** overlap (red) with the wear % per interlock.
+
+    This is the ``full_recon_mask`` — the geometric result of combining the
+    vertical and horizontal reconstructions, independent of the source texture.
+    """
+    h, w = shape
+    vis = np.full((h, w, 3), 18, dtype=np.uint8)   # near-black canvas
+    if link is None:
+        return vis
+
+    # ── all reconstructed area A crescents (blue, filled + outlined) ──
+    all_sides = {**link.get("sides", {}), **link.get("extra_sides", {})}
+    for side, sd in all_sides.items():
+        poly = sd.get("area_A_poly")
+        if poly is None or len(poly) < 3:
+            continue
+        A = _poly_mask(poly, shape)
+        vis[A > 0] = (150, 90, 30)
+        cv2.polylines(vis, [poly.astype(np.int32)], True, BLUE, 2, cv2.LINE_AA)
+
+    # ── all reconstructed circle B caps (green, filled + outlined) ──
+    for c in wire.get("circles", []):
+        B = _circle_mask(c["center"], c["radius"], shape)
+        g = np.zeros_like(vis); g[B > 0] = (30, 130, 30)
+        vis = cv2.addWeighted(vis, 1.0, g, 0.6, 0)
+        cx, cy, r = int(c["center"][0]), int(c["center"][1]), int(round(c["radius"]))
+        cv2.circle(vis, (cx, cy), r, GREEN, 2, cv2.LINE_AA)
+
+    # ── measured overlaps (red) + per-interlock wear ──
+    for p in wear.get("pairs", []):
+        om = p.get("overlap_mask")
+        if om is not None:
+            vis[om > 0] = OVER
+        c = p["circle"]; cx, cy = int(c["center"][0]), int(c["center"][1])
+        cv2.putText(vis, f"A^B={p['area_overlap']}px2", (cx - 70, cy - int(c["radius"]) - 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, OVER, 2, cv2.LINE_AA)
+        cv2.putText(vis, f"wear={p['wear_pct']:.1f}%", (cx - 70, cy - int(c["radius"]) - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, WHITE, 2, cv2.LINE_AA)
+
+    # ── legend + banner ──
+    cv2.putText(vis, "A (link crescent)", (14, h - 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, BLUE, 2, cv2.LINE_AA)
+    cv2.putText(vis, "B (wire cap)",      (14, h - 44), cv2.FONT_HERSHEY_SIMPLEX, 0.6, GREEN, 2, cv2.LINE_AA)
+    cv2.putText(vis, "A n B (overlap)",   (14, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, OVER, 2, cv2.LINE_AA)
+    wl = wear.get("wear_pct_left"); wr = wear.get("wear_pct_right")
+    trig = wear.get("trigger") or {}
+    tflag = "TRIGGERED" if trig.get("triggered") else "NOT TRIGGERED"
+    banner = (f"d={wear.get('d_mean_px',0):.0f}px  b={wear.get('b_px',0):.0f}px   "
+              f"wear L={_fmt(wl)}  R={_fmt(wr)}")
+    cv2.rectangle(vis, (8, 12), (8 + 12 * len(banner), 44), (20, 20, 20), -1)
+    cv2.putText(vis, banner, (14, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.6, WHITE, 2, cv2.LINE_AA)
+    tline = f"[{tflag}] {trig.get('reason', '')}"
+    cv2.rectangle(vis, (8, 48), (8 + 11 * len(tline), 78), (20, 20, 20), -1)
+    cv2.putText(vis, tline, (14, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                GREEN if trig.get("triggered") else ORANGE, 2, cv2.LINE_AA)
+    return vis
+
+
+def draw_recon_overlay(image: np.ndarray, link: Optional[Dict], wire: Dict,
+                       wear: Dict, alpha: float = 0.45) -> np.ndarray:
+    """
+    Reconstruction composited with **opacity over the real (corrected) image**:
+    filled area A (blue) and every cap area B (green) at ``alpha`` transparency,
+    each measured A∩B overlap (red, stronger) with its wear %, plus a banner.
+    Same information as ``full_recon_mask`` but on the actual photo so the
+    geometry can be checked against the chain texture.
+    """
+    vis = image.copy()
+    if vis.ndim == 2:
+        vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+    shape = vis.shape[:2]
+    all_sides = {**link.get("sides", {}), **link.get("extra_sides", {})} if link else {}
+
+    # translucent fills: A (blue), then B (green) on top
+    layer = vis.copy()
+    A = np.zeros(shape, np.uint8)
+    for sd in all_sides.values():
+        poly = sd.get("area_A_poly")
+        if poly is not None and len(poly) >= 3:
+            cv2.fillPoly(A, [poly.astype(np.int32)], 255)
+    B = np.zeros(shape, np.uint8)
+    for c in wire.get("circles", []):
+        cv2.circle(B, (int(c["center"][0]), int(c["center"][1])), int(round(c["radius"])), 255, -1)
+    layer[A > 0] = BLUE
+    layer[B > 0] = GREEN
+    reg = (A > 0) | (B > 0)
+    blended = cv2.addWeighted(vis, 1 - alpha, layer, alpha, 0)
+    vis[reg] = blended[reg]
+
+    # measured overlaps (red, higher opacity)
+    for p in wear.get("pairs", []):
+        om = p.get("overlap_mask")
+        if om is None:
+            continue
+        oc = vis.copy(); oc[om > 0] = OVER
+        b2 = cv2.addWeighted(vis, 0.30, oc, 0.70, 0)
+        vis[om > 0] = b2[om > 0]
+
+    # outlines for crispness
+    for sd in all_sides.values():
+        poly = sd.get("area_A_poly")
+        if poly is not None and len(poly) >= 3:
+            cv2.polylines(vis, [poly.astype(np.int32)], True, BLUE, 2, cv2.LINE_AA)
+    for c in wire.get("circles", []):
+        cv2.circle(vis, (int(c["center"][0]), int(c["center"][1])),
+                   int(round(c["radius"])), GREEN, 2, cv2.LINE_AA)
+
+    # per-interlock wear labels
+    for p in wear.get("pairs", []):
+        c = p["circle"]; cx, cy = int(c["center"][0]), int(c["center"][1])
+        cv2.putText(vis, f"{p['wear_pct']:.1f}%", (cx - 42, cy - int(c["radius"]) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, WHITE, 3, cv2.LINE_AA)
+        cv2.putText(vis, f"{p['wear_pct']:.1f}%", (cx - 42, cy - int(c["radius"]) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, OVER, 2, cv2.LINE_AA)
+
+    # banner
+    trig = wear.get("trigger") or {}
+    tflag = "TRIGGERED" if trig.get("triggered") else "NOT TRIGGERED"
+    n = trig.get("n_interlocks", len(wear.get("pairs", [])))
+    banner = f"d={wear.get('d_mean_px',0):.0f}px  b={wear.get('b_px',0):.0f}px   interlocks={n}"
+    cv2.rectangle(vis, (8, 10), (8 + 12 * len(banner), 42), (20, 20, 20), -1)
+    cv2.putText(vis, banner, (14, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, WHITE, 2, cv2.LINE_AA)
+    tline = f"[{tflag}] {trig.get('reason', '')}"
+    cv2.rectangle(vis, (8, 46), (8 + 11 * len(tline), 76), (20, 20, 20), -1)
+    cv2.putText(vis, tline, (14, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                GREEN if trig.get("triggered") else ORANGE, 2, cv2.LINE_AA)
+    return vis

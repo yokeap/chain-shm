@@ -72,6 +72,44 @@ def _pair_left_oval(bw: np.ndarray):
     return tops[0]["comp"], bots[0]["comp"]
 
 
+def _all_rail_pairs(bw: np.ndarray):
+    """Every flat-link (top_comp, bot_comp) rail pair, ordered left→right.
+
+    Each flat link shows as a top band + a bottom band (hole between).  We split
+    blobs into top/bot halves by median row, then pair a top band with the bottom
+    band it overlaps most in x.  Returns a list so *all* links in the frame can be
+    reconstructed (not only the leftmost)."""
+    lab, n = scipy_label(bw > 0)
+    blobs = []
+    for i in range(1, n + 1):
+        comp = (lab == i)
+        if comp.sum() < 2000:
+            continue
+        rows = np.where(comp.any(axis=1))[0]
+        cols = np.where(comp.any(axis=0))[0]
+        blobs.append({"comp": comp, "cy": rows.mean(), "cx": cols.mean(),
+                      "x0": int(cols[0]), "x1": int(cols[-1])})
+    if len(blobs) < 2:
+        return []
+    med = np.median([b["cy"] for b in blobs])
+    tops = sorted([b for b in blobs if b["cy"] < med],  key=lambda b: b["cx"])
+    bots = [b for b in blobs if b["cy"] >= med]
+    pairs, used = [], set()
+    for t in tops:
+        best, bi, bov = None, -1, 0
+        for j, b in enumerate(bots):
+            if j in used:
+                continue
+            ov = min(t["x1"], b["x1"]) - max(t["x0"], b["x0"])   # x-overlap
+            if ov > bov:
+                bov, best, bi = ov, b, j
+        if best is not None and bov > 0:
+            used.add(bi)
+            pairs.append((t["cx"], t["comp"], best["comp"]))
+    pairs.sort(key=lambda p: p[0])
+    return [(t, b) for _, t, b in pairs]
+
+
 def _scan(comp: np.ndarray):
     """Per-column first/last white row over the columns the comp occupies."""
     xs, e0, e1 = [], [], []
@@ -129,28 +167,59 @@ def model_link(
     px_per_mm: float = 1.0,
 ) -> Optional[Dict]:
     """
-    Build the 12-point vertical-link model for the (leftmost) link.
+    Reconstruct **every** flat link visible in ``vert_mask`` (not just the
+    leftmost), so each crossing wire cap can be measured against the crescent it
+    is inserted into.
 
-    Points 1,2,7,8 (outer corners) are placed at the **intersection of the
-    vertical link with the crossing horizontal chain**: the x is the vertical
-    link's outer extent (its junction/neck with the horizontal band) and the y
-    is the horizontal band's top/bottom edge (from ``wire_mask``).  Points
-    3,4,5,6 (inner corners) sit on the link hole boundary, x-aligned per side.
-    If ``wire_mask`` is None the outer corners fall back to the inner corners
-    offset outward by the bar thickness ``d``.
+    Returns the leftmost link's dict (12 points, ``d``, ``sides``) — kept as the
+    "primary" for the thickness annotation — augmented with:
+        extra_sides : {"link1_left": {...}, "link1_right": {...}, ...}
+                      crescents of the *other* flat links (area A pool), keyed
+                      uniquely so ``wear_overlap`` can pair each wire cap B with
+                      the correct crescent A regardless of which link it is on.
+        all_links   : list of every per-link dict, left→right.
 
-    Returns a dict (or None) with:
-        d_top_px, d_bot_px, d_mean_px, (+ _mm)
-        p1..p12                    – annotation points (x, y)
-        apex_x
-        sides = {"left": {...}, "right": {...}}
+    Each per-link dict follows ``resource/vertical_mask_annotated.png``: points
+    1,2,7,8 (outer corners) at the vertical∩horizontal junction, 3,4,5,6 (inner)
+    on the hole boundary, 9-12 the bar thickness ``d``; ``sides[*].area_A_poly``
+    is the reconstructed end-crescent.
     """
     _, bw = cv2.threshold(vert_mask, 127, 255, cv2.THRESH_BINARY)
-    top, bot = _pair_left_oval(bw)
-    if top is None:
-        logger.warning("model_link: no link pair found in vert_mask")
+    wbw = None
+    if wire_mask is not None:
+        _, wbw = cv2.threshold(wire_mask, 127, 255, cv2.THRESH_BINARY)
+    w = vert_mask.shape[1]
+
+    pairs = _all_rail_pairs(bw)
+    if not pairs:                       # fall back to the leftmost rail pair
+        top, bot = _pair_left_oval(bw)
+        if top is None:
+            logger.warning("model_link: no link pair found in vert_mask")
+            return None
+        pairs = [(top, bot)]
+
+    links = [ld for t, b in pairs
+             if (ld := _model_one_link(t, b, wbw, w, px_per_mm)) is not None]
+    if not links:
+        logger.warning("model_link: no reconstructable link")
         return None
 
+    links.sort(key=lambda l: l["x_outer"][0])
+    primary = links[0]
+    extra: Dict = {}
+    for j, l in enumerate(links[1:], start=1):
+        for sk, sd in l["sides"].items():
+            extra[f"link{j}_{sk}"] = sd
+    primary["extra_sides"] = extra
+    primary["all_links"] = links
+    logger.info(f"model_link: modelled {len(links)} flat link(s)")
+    return primary
+
+
+def _model_one_link(top: np.ndarray, bot: np.ndarray,
+                    wbw: Optional[np.ndarray], w: int,
+                    px_per_mm: float = 1.0) -> Optional[Dict]:
+    """Reconstruct one flat link: 12 control points + both crescents (area A)."""
     xt, t_out, t_in = _scan(top)   # top rail: outer(top edge), inner(bottom edge)
     xb, b_in, b_out = _scan(bot)   # bot rail: inner(top edge),  outer(bottom edge)
     if len(xt) < 10 or len(xb) < 10:
@@ -185,8 +254,7 @@ def model_link(
     p6 = (float(x_hR), at(xb, b_in, x_hR))   # right inner bot
 
     # ── outer corners: vertical∩horizontal intersection ──
-    if wire_mask is not None:
-        _, wbw = cv2.threshold(wire_mask, 127, 255, cv2.THRESH_BINARY)
+    if wbw is not None:
         span = x_oR - x_oL
         yTl, yBl = _band_edges(wbw, x_oL - span // 6, x_oL + span // 6)
         yTr, yBr = _band_edges(wbw, x_oR - span // 6, x_oR + span // 6)
@@ -235,14 +303,20 @@ def model_link(
     }
     logger.info(f"model_link: area_A left={areaL:.0f}px²  right={areaR:.0f}px²")
 
+    # ── Full-link check: both outer ends of the link must be inside the frame.
+    # A link cut off by the frame edge is only partially reconstructable.
+    margin = max(15, int(w * 0.02))
+    link_full = bool(x_oL > margin and x_oR < w - margin)
     logger.info(f"model_link: apex={apex}  d_top={d_top:.1f} d_bot={d_bot:.1f} "
-                f"d_mean={d_mean:.1f}px")
+                f"d_mean={d_mean:.1f}px  x_outer=[{x_oL},{x_oR}]  full={link_full}")
 
     return {
         "d_top_px": float(d_top), "d_top_mm": float(d_top) / px_per_mm,
         "d_bot_px": float(d_bot), "d_bot_mm": float(d_bot) / px_per_mm,
         "d_mean_px": float(d_mean), "d_mean_mm": float(d_mean) / px_per_mm,
         "apex_x": apex, "top_y1": int(min(p9[1], p10[1])),
+        "x_outer": (int(x_oL), int(x_oR)), "frame_w": int(w),
+        "link_full": link_full,
         "p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5, "p6": p6,
         "p7": p7, "p8": p8, "p9": p9, "p10": p10, "p11": p11, "p12": p12,
         "sides": sides,
@@ -325,6 +399,13 @@ def draw_link(vert_mask: np.ndarray, link: Dict) -> np.ndarray:
 
     _area_label(vis, L, _WHITE)
     _area_label(vis, R, _WHITE)
+
+    # extra flat links (their crescents feed the wear pool too)
+    for sd in link.get("extra_sides", {}).values():
+        _fill_poly(vis, sd["area_A_poly"], _FILL_R)
+        _dashed(vis, sd["inner_pts"], _RED)
+        _dashed(vis, sd["outer_pts"], _BLUE)
+        _area_label(vis, sd, _WHITE)
 
     colmap = {"p1": _YELLOW, "p2": _YELLOW, "p7": _YELLOW, "p8": _YELLOW,
               "p3": _GREEN, "p4": _GREEN, "p5": _GREEN, "p6": _GREEN,
