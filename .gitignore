@@ -10,6 +10,8 @@ wheels/
 .venv
 
 # Debug / generated pipeline output
-debug_v2/
 debug_seg/
 debug/
+
+# NOTE: debug_v2/ is intentionally tracked — it holds the per-process report
+# figures + wear reports needed to build the research report on another machine.

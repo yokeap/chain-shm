@@ -1,0 +1,18 @@
+────────────────────────────────────────────────────────
+  Image   : ./sample/chain3.png
+  Elapsed : 55.9s
+────────────────────────────────────────────────────────
+  d (vertical, mean) = 208.0 px
+  b (horizontal)     = 218.9 px
+────────────────────────────────────────────────────────
+  Trigger : TRIGGERED  (wire_full=True, interlock=True)
+            3 interlock(s) measured
+────────────────────────────────────────────────────────
+  Wear = area(A∩B) / area(A)   [raw | parallax-corrected to frame centre]
+     left @x= 852: raw= 25.0%  corr= 25.4%   (A=52490  B=37297  A∩B=13109)
+    right @x=1669: raw= 26.7%  corr= 23.9%   (A=60311  B=37297  A∩B=16074)
+    right @x= 322: raw= 21.2%  corr= 23.7%   (A=55071  B=36625  A∩B=11673)
+────────────────────────────────────────────────────────
+  Parallax slope  : +3.88%/1000px  (left→right ramp removed)
+  WEAR (corrected): 24.3%   [frame-centre, parallax-free]
+────────────────────────────────────────────────────────
